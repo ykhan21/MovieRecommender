@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 
 # Function to load movies from the movies.dat file
 @st.cache_data
@@ -17,17 +18,112 @@ def load_movies(dat_file_path):
 def get_image_url(movie_id):
     return f"https://liangfgithub.github.io/MovieImages/{movie_id}.jpg"
 
-# Abstracted recommender function
+# Load rating matrix and similarity matrix
+@st.cache_data
+def load_recommendation_data():
+    # Paths to be updated based on your file locations
+    R = pd.read_csv('Rmat.csv', index_col=0)
+    S = pd.read_csv('movie_similarity_matrix.csv', index_col=0)
+    
+    # Remove prefixes
+    R.index = R.index.str.lstrip('u').astype(int)
+    R.columns = R.columns.str.lstrip('m').astype(int)
+    
+    return R, S
+
+# System I: Recommendation Based on Popularity
+def get_popular_movies(top_n=10):
+    R = pd.read_csv('Rmat.csv', index_col=0)
+    R.index = R.index.str.lstrip('u').astype(int)
+    R.columns = R.columns.str.lstrip('m').astype(int)
+
+    rating_counts = R.notna().sum()
+    avg_ratings = R.mean()
+    popular_movies = rating_counts[(rating_counts >= 50) & (avg_ratings >= 3.5)]
+    popular_movies_sorted = popular_movies.sort_values(ascending=False).head(top_n)
+
+    # Convert to DataFrame with movie details
+    popular_movies_df = movies_df[movies_df["id"].isin(popular_movies_sorted.index)]
+    popular_movies_df = popular_movies_df.copy()  # Avoid SettingWithCopyWarning
+    popular_movies_df["score"] = popular_movies_sorted.values
+    return popular_movies_df
+
 def recommender(ratings_dict, movies_df, top_n=10):
+    # Create new_user Series with integer index, allowing NaN values
+    new_user = pd.Series(dtype=float, index=movies_df['id'])
+    
+    # Add rated movies to new_user
+    for title, rating in ratings_dict.items():
+        matching_movies = movies_df[movies_df['title'] == title]
+        if not matching_movies.empty and rating > 0:
+            new_user[matching_movies.iloc[0]['id']] = rating
+
+    try:
+        R, S = load_recommendation_data()
+        
+        # Remove any NaN values from new_user
+        new_user = new_user.dropna()
+        
+        # Ensure S is using string column labels
+        S.columns = S.columns.astype(str)
+        
+        # Call myIBCF with modified function
+        recommendations = myIBCF(new_user, S, R)
+
+        # If no recommendations, fall back to popular movies
+        if recommendations.empty:
+            print(f"Recommendations is empty.")
+            return get_popular_movies(top_n)
+
+        # Merge recommendations with movie details
+        recommended_movies = recommendations.merge(movies_df, on="id", how="left")
+        return recommended_movies
+    except Exception as e:
+        print(f"Error in recommendation: {e}")
+        return get_popular_movies(top_n)
+
+def myIBCF(new_user, S, R):
     """
-    Placeholder recommendation function.
-    Replace this with your own recommendation algorithm.
+    Compute movie recommendations for a new user using Item-Based Collaborative Filtering.
     """
-    unrated_movies = movies_df[
-        ~movies_df["title"].isin([title for title, rating in ratings_dict.items() if rating > 0])
-    ]
-    recommendations = unrated_movies.head(top_n)
-    return recommendations
+    # Ensure new_user index is clean
+    new_user = new_user[new_user.notna()]
+    
+    predictions = {}
+    for movie_id in S.columns:
+        # Convert movie_id to integer
+        movie_id = int(movie_id)
+        
+        # Check if the movie is not already rated by the user
+        if movie_id not in new_user.index:
+            # Get similar movies
+            neighbors = S.loc[:, str(movie_id)].dropna()
+            
+            # Find rated neighbors
+            rated_neighbors = [
+                int(r) for r in neighbors.index 
+                if int(r) in new_user.index and not pd.isna(new_user[int(r)])
+            ]
+            
+            if rated_neighbors:
+                numerator = sum(
+                    neighbors[str(r)] * new_user[r] 
+                    for r in rated_neighbors
+                )
+                denominator = sum(neighbors[str(r)] for r in rated_neighbors)
+                
+                if denominator > 0:
+                    predictions[movie_id] = numerator / denominator
+
+    # Convert to DataFrame and sort
+    if predictions:
+        predictions_df = pd.DataFrame.from_dict(predictions, orient='index', columns=['score'])
+        predictions_df.index.name = 'id'
+        predictions_df.reset_index(inplace=True)
+        predictions_df.sort_values(by='score', ascending=False, inplace=True)
+        return predictions_df.head(10)
+    else:
+        return pd.DataFrame(columns=['id', 'score'])  # Return empty DataFrame with correct columns
 
 # Load movies
 MOVIE_DAT_PATH = "movies.dat"
@@ -163,6 +259,7 @@ if st.session_state["show_recommendations"]:
     
     # Call the abstracted recommender function
     recommendations = recommender(st.session_state["ratings"], movies_df, top_n=10)
+    print(recommendations)
     
     # Display the recommendations
     for idx, row in recommendations.iterrows():
